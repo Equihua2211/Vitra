@@ -1,0 +1,486 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <BluetoothSerial.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Adafruit_PCF8574.h>
+#include <SPI.h>
+#include <nRF24L01.h>
+#include <RF24.h>
+
+// ================= PINES Y HARDWARE =================
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+Adafruit_PCF8574 pcf;
+
+// LEDs (Modo Sink - Lógica Invertida: HIGH=Apagado, LOW=Encendido)
+#define LED_RF 0
+#define LED_BT 1
+#define LED_WIFI 2
+#define LED_ENVIADO 3  // Verde
+#define LED_RECIBIDO 4 // Rojo
+
+// Arreglo de pines Braille (Puntos 3 y 6 corregidos por software: 27 y 26)
+const int pinesBraille[6] = {2, 12, 13, 14, 27, 26};
+
+// Encoder
+#define ENC_CLK 32
+#define ENC_DT 33
+#define ENC_SW 25
+
+// Botones Principales y Actuadores
+#define BTN_ENVIAR_LEER 15
+#define BTN_MODO 0    // Pin seguro para el arranque
+
+#define BUZZER 17
+#define MOTOR 16      // Pin seguro para el transistor del motor
+
+// NRF24 (KELLER 1)
+RF24 radio(5, 4);
+const byte direccion1[6] = "00001";
+const byte direccion2[6] = "00002";
+
+// ================= COMUNICACIÓN =================
+BluetoothSerial SerialBT;
+WebServer server(80);
+
+// ================= VARIABLES GLOBALES =================
+int modoActual = 0; // 0: RF, 1: BT, 2: WiFi
+bool mensajePendiente = false;
+String mensajeEntrante = "";
+unsigned long tiempoUltimaAlerta = 0;
+bool estadoAlerta = false;
+
+String mensajeParaAppWiFi = "";
+
+// Variables de Interfaz
+String mensajeActual = "";
+const String alfabeto = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 <?"; 
+int indiceAbecedario = 0;
+int lastClkState;
+
+// Variables Teclado Braille
+bool brailleActivo = false;
+bool maxBraille[6] = {false, false, false, false, false, false};
+
+// ================= DECLARACIÓN DE FUNCIONES =================
+void cambiarModo(int modo);
+void recibirPorWiFi();
+void enviarAAppWiFi();
+void reproducirMorse(String texto);
+void emitirMorse(String secuencia);
+String decodificarBraille(bool b1, bool b2, bool b3, bool b4, bool b5, bool b6);
+void actualizarPantalla();
+void animacionInicio();
+void enviarMensaje(String texto);
+void sonarFeedback(int tipo);
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  
+  Wire.begin(21, 22);
+  lcd.init();
+  lcd.backlight();
+  
+  if (!pcf.begin(0x20, &Wire)) {
+    Serial.println("Error iniciando PCF8574");
+  }
+
+  // Apagar LEDs al inicio
+  for(int i=0; i<=4; i++) {
+    pcf.pinMode(i, OUTPUT);
+    pcf.digitalWrite(i, HIGH); 
+  }
+
+  for (int i = 0; i < 6; i++) pinMode(pinesBraille[i], INPUT_PULLUP);
+  pinMode(BTN_ENVIAR_LEER, INPUT_PULLUP);
+  pinMode(BTN_MODO, INPUT_PULLUP);
+  pinMode(ENC_CLK, INPUT_PULLUP);
+  pinMode(ENC_DT, INPUT_PULLUP);
+  pinMode(ENC_SW, INPUT_PULLUP);
+  
+  pinMode(BUZZER, OUTPUT);
+  pinMode(MOTOR, OUTPUT);
+  digitalWrite(MOTOR, LOW);
+  digitalWrite(BUZZER, LOW);
+
+  // Inicializar Radio
+  radio.begin();
+  radio.openWritingPipe(direccion1);     
+  radio.openReadingPipe(1, direccion2);  
+  radio.startListening();
+
+  // Inicializar Bluetooth y WiFi
+  SerialBT.begin("Keller_System_1"); 
+  WiFi.softAP("Keller_System_1");
+  server.on("/recibir", recibirPorWiFi); 
+  server.on("/leer", enviarAAppWiFi);    
+  server.begin();
+
+  lastClkState = digitalRead(ENC_CLK);
+
+  animacionInicio();
+  cambiarModo(0); 
+  actualizarPantalla();
+}
+
+// ================= LOOP PRINCIPAL =================
+void loop() {
+  server.handleClient(); 
+
+  // --- 1. RECEPCIÓN DE MENSAJES (RF y BT) ---
+  if (radio.available() && !mensajePendiente) {
+    char msjRF[32] = "";
+    radio.read(&msjRF, sizeof(msjRF));
+    mensajeEntrante = String(msjRF);
+    mensajeEntrante.toUpperCase();
+    mensajePendiente = true;
+    pcf.digitalWrite(LED_RECIBIDO, LOW); // Enciende Rojo
+  }
+
+  if (SerialBT.available() && !mensajePendiente) {
+    mensajeEntrante = SerialBT.readStringUntil('\n');
+    mensajeEntrante.trim();
+    mensajeEntrante.toUpperCase();
+    mensajePendiente = true;
+    pcf.digitalWrite(LED_RECIBIDO, LOW); // Enciende Rojo
+  }
+
+  // --- 2. ALERTA Y LECTURA ---
+  if (mensajePendiente) {
+    if (millis() - tiempoUltimaAlerta > 1000) {
+      estadoAlerta = !estadoAlerta;
+      digitalWrite(MOTOR, estadoAlerta ? HIGH : LOW);
+      digitalWrite(BUZZER, estadoAlerta ? HIGH : LOW);
+      tiempoUltimaAlerta = millis();
+    }
+
+    lcd.setCursor(0,0); lcd.print("   NUEVO MENSAJE!   ");
+    lcd.setCursor(0,1); lcd.print("Presiona LEER       ");
+
+    if (digitalRead(BTN_ENVIAR_LEER) == LOW) {
+      delay(200); 
+      digitalWrite(MOTOR, LOW);  
+      digitalWrite(BUZZER, LOW);
+      pcf.digitalWrite(LED_RECIBIDO, HIGH); // Apaga Rojo
+      
+      lcd.clear();
+      lcd.setCursor(0,0); lcd.print("Mensaje:");
+      lcd.setCursor(0,1); lcd.print(mensajeEntrante);
+
+      reproducirMorse(mensajeEntrante);
+      
+      mensajePendiente = false; 
+      delay(2000); 
+      actualizarPantalla();
+    }
+    return; 
+  }
+
+  // --- 3. ESCRITURA Y CONTROL DE INTERFAZ ---
+  bool UI_cambiada = false;
+
+  // Cambiar Modo
+  if (digitalRead(BTN_MODO) == LOW) {
+    delay(200); 
+    modoActual++;
+    if (modoActual > 2) modoActual = 0;
+    cambiarModo(modoActual);
+    sonarFeedback(1); // Sonido confirmación de modo
+    UI_cambiada = true;
+  }
+
+  // Enviar Mensaje
+  if (digitalRead(BTN_ENVIAR_LEER) == LOW && mensajeActual.length() > 0) {
+    delay(200);
+    enviarMensaje(mensajeActual);
+    mensajeActual = ""; 
+    UI_cambiada = true;
+  }
+
+  // Encoder (Giro)
+  int clkState = digitalRead(ENC_CLK);
+  if (clkState != lastClkState && clkState == LOW) {
+    if (digitalRead(ENC_DT) != clkState) indiceAbecedario++;
+    else indiceAbecedario--;
+    
+    if (indiceAbecedario < 0) indiceAbecedario = alfabeto.length() - 1;
+    if (indiceAbecedario >= alfabeto.length()) indiceAbecedario = 0;
+    
+    sonarFeedback(4); // Sonido de navegación rápido
+    UI_cambiada = true;
+  }
+  lastClkState = clkState;
+
+  // Encoder (Botón)
+  if (digitalRead(ENC_SW) == LOW) {
+    delay(200); 
+    char letraSelec = alfabeto.charAt(indiceAbecedario);
+    if (letraSelec == '<') {
+      if (mensajeActual.length() > 0) {
+        mensajeActual.remove(mensajeActual.length() - 1);
+        sonarFeedback(3); // Sonido de borrar
+      }
+    } else {
+      if (mensajeActual.length() < 20) {
+        mensajeActual += letraSelec;
+        sonarFeedback(1); // Sonido letra confirmada
+      }
+    }
+    UI_cambiada = true;
+  }
+
+  // Teclado Braille
+  bool b[6];
+  bool algunoPresionado = false;
+  for(int i=0; i<6; i++) {
+    b[i] = (digitalRead(pinesBraille[i]) == LOW);
+    if (b[i]) algunoPresionado = true;
+  }
+
+  if (algunoPresionado) {
+    brailleActivo = true;
+    for(int i=0; i<6; i++) {
+      if (b[i]) maxBraille[i] = true; 
+    }
+  } else if (brailleActivo && !algunoPresionado) {
+    String lecturaBraille = decodificarBraille(maxBraille[0], maxBraille[1], maxBraille[2], maxBraille[3], maxBraille[4], maxBraille[5]);
+    
+    if (lecturaBraille != "*") {
+      if (lecturaBraille == "<") {
+        if (mensajeActual.length() > 0) {
+          mensajeActual.remove(mensajeActual.length() - 1);
+          sonarFeedback(3); // Sonido borrar
+        }
+      } else {
+        if (mensajeActual.length() + lecturaBraille.length() <= 20) {
+           mensajeActual += lecturaBraille;
+           
+           // Diferenciar sonido si es atajo o letra
+           if (lecturaBraille.length() > 1) sonarFeedback(2); // Atajo
+           else sonarFeedback(1); // Letra individual
+        }
+      }
+      UI_cambiada = true;
+    }
+    
+    brailleActivo = false;
+    for(int i=0; i<6; i++) maxBraille[i] = false; 
+  }
+
+  if (UI_cambiada) actualizarPantalla();
+}
+
+// ================= FUNCIONES DEL SISTEMA =================
+
+void sonarFeedback(int tipo) {
+  switch (tipo) {
+    case 1: // Letra individual / Selección
+      digitalWrite(BUZZER, HIGH); delay(60); digitalWrite(BUZZER, LOW);
+      break;
+    case 2: // Atajo / Palabra completa (Doble pulso)
+      digitalWrite(BUZZER, HIGH); delay(60); digitalWrite(BUZZER, LOW);
+      delay(50);
+      digitalWrite(BUZZER, HIGH); delay(60); digitalWrite(BUZZER, LOW);
+      break;
+    case 3: // Borrar
+      digitalWrite(BUZZER, HIGH); delay(150); digitalWrite(BUZZER, LOW);
+      break;
+    case 4: // Navegación Encoder
+      digitalWrite(BUZZER, HIGH); delay(10); digitalWrite(BUZZER, LOW);
+      break;
+  }
+}
+
+void animacionInicio() {
+  lcd.clear();
+  lcd.setCursor(7, 1); lcd.print("KELLER");
+  lcd.setCursor(7, 2); lcd.print("SYSTEM");
+  delay(1500);
+  
+  lcd.clear();
+  lcd.setCursor(0, 1); lcd.print("Iniciando V2.0...");
+  for(int i=0; i<20; i++) {
+    lcd.setCursor(i, 2);
+    lcd.write(255); 
+    delay(80);
+    sonarFeedback(4); // Sonido de carga
+  }
+  delay(500);
+  lcd.clear();
+}
+
+void actualizarPantalla() {
+  lcd.clear();
+  lcd.setCursor(0, 0); 
+  lcd.print(">" + mensajeActual);
+  
+  lcd.setCursor(0, 2);
+  lcd.print("Letra: [ ");
+  lcd.print(alfabeto.charAt(indiceAbecedario));
+  lcd.print(" ]");
+
+  lcd.setCursor(0, 3);
+  if (modoActual == 0) lcd.print("Modo: Radio RF");
+  else if (modoActual == 1) lcd.print("Modo: Bluetooth");
+  else lcd.print("Modo: Red Local");
+}
+
+void cambiarModo(int modo) {
+  pcf.digitalWrite(LED_RF, HIGH); 
+  pcf.digitalWrite(LED_BT, HIGH);
+  pcf.digitalWrite(LED_WIFI, HIGH);
+
+  switch (modo) {
+    case 0:
+      pcf.digitalWrite(LED_RF, LOW); 
+      radio.startListening();
+      break;
+    case 1:
+      pcf.digitalWrite(LED_BT, LOW); 
+      radio.stopListening();
+      break;
+    case 2:
+      pcf.digitalWrite(LED_WIFI, LOW); 
+      radio.stopListening();
+      break;
+  }
+}
+
+void enviarMensaje(String texto) {
+  pcf.digitalWrite(LED_ENVIADO, LOW); // Enciende Verde
+  digitalWrite(BUZZER, HIGH); delay(150); digitalWrite(BUZZER, LOW);
+  delay(50);
+  digitalWrite(BUZZER, HIGH); delay(150); digitalWrite(BUZZER, LOW);
+
+  if (modoActual == 0) { 
+    radio.stopListening();
+    char buf[32];
+    texto.toCharArray(buf, 32);
+    radio.write(&buf, sizeof(buf)); 
+    radio.startListening();
+  } 
+  else if (modoActual == 1) { 
+    SerialBT.println(texto);
+  }
+  else if (modoActual == 2) {
+    mensajeParaAppWiFi = texto; 
+  }
+  
+  delay(300);
+  pcf.digitalWrite(LED_ENVIADO, HIGH); // Apaga Verde
+}
+
+void recibirPorWiFi() {
+  if (server.hasArg("mensaje")) {
+    mensajeEntrante = server.arg("mensaje");
+    mensajeEntrante.toUpperCase(); 
+    mensajePendiente = true;
+    pcf.digitalWrite(LED_RECIBIDO, LOW); 
+    server.send(200, "text/plain", "Recibido");
+  } else {
+    server.send(400, "text/plain", "Error");
+  }
+}
+
+void enviarAAppWiFi() {
+  if (mensajeParaAppWiFi.length() > 0) {
+    server.send(200, "text/plain", mensajeParaAppWiFi);
+    mensajeParaAppWiFi = ""; 
+  } else {
+    server.send(200, "text/plain", ""); 
+  }
+}
+
+// ================= DICCIONARIO KELLER COMPLETO =================
+
+String decodificarBraille(bool b1, bool b2, bool b3, bool b4, bool b5, bool b6) {
+  String estado = String(b1) + String(b2) + String(b3) + String(b4) + String(b5) + String(b6);
+  
+  // LETRAS (26)
+  if (estado == "100000") return "A"; if (estado == "101000") return "B";
+  if (estado == "110000") return "C"; if (estado == "110100") return "D";
+  if (estado == "100100") return "E"; if (estado == "111000") return "F";
+  if (estado == "111100") return "G"; if (estado == "101100") return "H";
+  if (estado == "011000") return "I"; if (estado == "011100") return "J";
+  if (estado == "100010") return "K"; if (estado == "101010") return "L";
+  if (estado == "110010") return "M"; if (estado == "110110") return "N";
+  if (estado == "100110") return "O"; if (estado == "111010") return "P";
+  if (estado == "111110") return "Q"; if (estado == "101110") return "R";
+  if (estado == "011010") return "S"; if (estado == "011110") return "T";
+  if (estado == "100011") return "U"; if (estado == "101011") return "V";
+  if (estado == "011101") return "W"; if (estado == "110011") return "X";
+  if (estado == "110111") return "Y"; if (estado == "100111") return "Z";
+  
+  // NÚMEROS (10)
+  if (estado == "100001") return "1"; if (estado == "101001") return "2"; 
+  if (estado == "110001") return "3"; if (estado == "110101") return "4"; 
+  if (estado == "100101") return "5"; if (estado == "111001") return "6"; 
+  if (estado == "111101") return "7"; if (estado == "101101") return "8"; 
+  if (estado == "011001") return "9"; if (estado == "001001") return "0"; 
+  
+  // FUNCIONES (3)
+  if (estado == "111111") return "<"; // BORRAR
+  if (estado == "000001") return " "; // ESPACIO
+  if (estado == "010001") return "?"; // INTERROGACIÓN
+
+  // ATAJOS DE EMERGENCIA (24)
+  if (estado == "000010") return "BAÑO ";    if (estado == "000011") return "AGUA ";
+  if (estado == "000100") return "HAMBRE ";  if (estado == "000101") return "SED ";
+  if (estado == "000110") return "COMER ";   if (estado == "000111") return "DORMIR ";
+  if (estado == "001000") return "DOLOR ";   if (estado == "001010") return "MEDICINA ";
+  if (estado == "001011") return "BIEN ";    if (estado == "001100") return "MAL ";
+  if (estado == "001101") return "CANSADO "; if (estado == "001110") return "MAREO ";
+  if (estado == "001111") return "AYUDA ";   if (estado == "010000") return "PELIGRO ";
+  if (estado == "010010") return "ALTO ";    if (estado == "010011") return "CALOR ";
+  if (estado == "010100") return "FRIO ";    if (estado == "010101") return "MEDICO ";
+  if (estado == "010110") return "HOLA ";    if (estado == "010111") return "ADIOS ";
+  if (estado == "011011") return "GRACIAS "; if (estado == "011111") return "POR FAVOR ";
+  if (estado == "101111") return "SI ";      if (estado == "111011") return "NO ";
+  
+  return "*"; // Ninguna combinación
+}
+
+// ================= ACTUADORES FÍSICOS =================
+
+void reproducirMorse(String texto) {
+  for (int i = 0; i < texto.length(); i++) {
+    char caracter = texto.charAt(i);
+    switch (caracter) {
+      case 'A': emitirMorse(".-"); break;   case 'B': emitirMorse("-..."); break;
+      case 'C': emitirMorse("-.-."); break; case 'D': emitirMorse("-.."); break;
+      case 'E': emitirMorse("."); break;    case 'F': emitirMorse("..-."); break;
+      case 'G': emitirMorse("--."); break;  case 'H': emitirMorse("...."); break;
+      case 'I': emitirMorse(".."); break;   case 'J': emitirMorse(".---"); break;
+      case 'K': emitirMorse("-.-"); break;  case 'L': emitirMorse(".-.."); break;
+      case 'M': emitirMorse("--"); break;   case 'N': emitirMorse("-."); break;
+      case 'O': emitirMorse("---"); break;  case 'P': emitirMorse(".--."); break;
+      case 'Q': emitirMorse("--.-"); break; case 'R': emitirMorse(".-."); break;
+      case 'S': emitirMorse("..."); break;  case 'T': emitirMorse("-"); break;
+      case 'U': emitirMorse("..-"); break;  case 'V': emitirMorse("...-"); break;
+      case 'W': emitirMorse(".--"); break;  case 'X': emitirMorse("-..-"); break;
+      case 'Y': emitirMorse("-.--"); break; case 'Z': emitirMorse("--.."); break;
+      
+      case '1': emitirMorse(".----"); break; case '2': emitirMorse("..---"); break;
+      case '3': emitirMorse("...--"); break; case '4': emitirMorse("....-"); break;
+      case '5': emitirMorse("....."); break; case '6': emitirMorse("-...."); break;
+      case '7': emitirMorse("--..."); break; case '8': emitirMorse("---.."); break;
+      case '9': emitirMorse("----."); break; case '0': emitirMorse("-----"); break;
+      case '?': emitirMorse("..--.."); break;
+      
+      case ' ': delay(1400); break; 
+    }
+    delay(600); 
+  }
+}
+
+void emitirMorse(String secuencia) {
+  for (int i = 0; i < secuencia.length(); i++) {
+    if (secuencia.charAt(i) == '.') {
+      digitalWrite(MOTOR, HIGH); delay(200); digitalWrite(MOTOR, LOW);
+    } else if (secuencia.charAt(i) == '-') {
+      digitalWrite(MOTOR, HIGH); delay(600); digitalWrite(MOTOR, LOW);
+    }
+    delay(200); 
+  }
+}
